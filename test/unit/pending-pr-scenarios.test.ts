@@ -1,8 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as repositories from "../../src/db/repositories";
 import { sanitizePublicComment } from "../../src/github/commands";
 import {
+  applyPendingPrDetectionToScoreInput,
   classifyOpenPullRequest,
   detectPendingPrScenario,
+  loadContributorRepoOpenPrSignalRecords,
 } from "../../src/scoring/pending-pr-scenarios";
 import { buildScorePreview } from "../../src/scoring/preview";
 import type { PullRequestRecord, PullRequestReviewRecord, ScoringModelSnapshotRecord } from "../../src/types";
@@ -197,5 +200,144 @@ describe("pending PR scenario detection", () => {
       "Estimated score 42, reward estimate, wallet abc, hotkey xyz, payout farming, reviewability ranking, raw trust score.";
     expect(sanitizePublicComment(dirty)).not.toMatch(/estimated score|reward estimate|wallet|hotkey|payout|farming|reviewability|raw trust score/i);
     expect(sanitizePublicComment(dirty)).toContain("private context");
+  });
+
+  it("returns null when there is nothing to project and handles closed-only queues", () => {
+    expect(
+      detectPendingPrScenario({
+        login: "miner-a",
+        repoFullName: "entrius/allways-ui",
+        pullRequests: [pr({ number: 1, state: "closed" })],
+        roleContext: outsideContributorRole,
+      }),
+    ).toBeNull();
+
+    expect(
+      detectPendingPrScenario({
+        login: "miner-a",
+        repoFullName: "entrius/allways-ui",
+        pullRequests: [pr({ number: 2, title: "Draft only", labels: ["draft"] })],
+        roleContext: outsideContributorRole,
+        reviewsByPullNumber: new Map([[2, [approvedReview(2)]]]),
+        checksByPullNumber: new Map([[2, []]]),
+      }),
+    ).toBeNull();
+  });
+
+  it("projects stale-close pressure without merge-ready PRs", () => {
+    const staleDate = new Date(Date.now() - 20 * 86_400_000).toISOString();
+    const detection = detectPendingPrScenario({
+      login: "miner-a",
+      repoFullName: "entrius/allways-ui",
+      pullRequests: [pr({ number: 30, updatedAt: staleDate, createdAt: staleDate })],
+      roleContext: outsideContributorRole,
+      reviewsByPullNumber: new Map([[30, [approvedReview(30)]]]),
+      checksByPullNumber: new Map([[30, []]]),
+    });
+    expect(detection).toMatchObject({ pendingMergedPrCount: 0, pendingClosedPrCount: 1, expectedOpenPrCountAfterMerge: 0 });
+    expect(detection?.scenarioNotes.join(" ")).toMatch(/stale/i);
+  });
+
+  it("classifies blocked PRs from failing checks and missing approvals", () => {
+    const blockedByChecks = classifyOpenPullRequest({
+      pr: pr({ number: 40 }),
+      roleContext: outsideContributorRole,
+      reviews: [approvedReview(40)],
+      checks: [{ id: "c1", repoFullName: "entrius/allways-ui", pullNumber: 40, name: "ci", status: "completed", conclusion: "timed_out", payload: {} }],
+    });
+    const blockedByApproval = classifyOpenPullRequest({
+      pr: pr({ number: 41 }),
+      roleContext: outsideContributorRole,
+      reviews: [],
+      checks: [],
+    });
+    expect(blockedByChecks.classification).toBe("blocked");
+    expect(blockedByApproval.classification).toBe("blocked");
+  });
+
+  it("recognizes draft heuristics and excludes pull numbers from detection", () => {
+    expect(
+      classifyOpenPullRequest({
+        pr: pr({ number: 50, title: "[Draft] spike", labels: [] }),
+        roleContext: outsideContributorRole,
+        reviews: [],
+        checks: [],
+      }).classification,
+    ).toBe("draft");
+    expect(
+      classifyOpenPullRequest({
+        pr: pr({ number: 51, title: "WIP change", labels: ["wip"] }),
+        roleContext: outsideContributorRole,
+        reviews: [],
+        checks: [],
+      }).classification,
+    ).toBe("draft");
+
+    const detection = detectPendingPrScenario({
+      login: "miner-a",
+      repoFullName: "entrius/allways-ui",
+      pullRequests: [pr({ number: 52 }), pr({ number: 53 })],
+      roleContext: outsideContributorRole,
+      excludePullNumbers: [52],
+      reviewsByPullNumber: new Map([
+        [52, [approvedReview(52)]],
+        [53, [approvedReview(53)]],
+      ]),
+      checksByPullNumber: new Map([
+        [52, []],
+        [53, []],
+      ]),
+    });
+    expect(detection?.pendingMergedPrCount).toBe(1);
+    expect(detection?.classified.some((entry) => entry.number === 52)).toBe(false);
+  });
+
+  it("preserves user-supplied expected open PR counts and skips observed score input merges", () => {
+    const user = detectPendingPrScenario({
+      login: "miner-a",
+      repoFullName: "entrius/allways-ui",
+      pullRequests: [],
+      roleContext: outsideContributorRole,
+      userSupplied: { expectedOpenPrCountAfterMerge: 1, approvedPrCount: 2 },
+    });
+    expect(user).toMatchObject({ source: "user_supplied", expectedOpenPrCountAfterMerge: 1, approvedPrCount: 2 });
+
+    const base = { repoFullName: "entrius/allways-ui", openPrCount: 3 };
+    expect(applyPendingPrDetectionToScoreInput(base, null)).toBe(base);
+    expect(
+      applyPendingPrDetectionToScoreInput(base, {
+        source: "user_supplied",
+        pendingMergedPrCount: 1,
+        pendingClosedPrCount: 0,
+        approvedPrCount: 0,
+        scenarioNotes: [],
+        classified: [],
+      }),
+    ).toBe(base);
+    expect(
+      applyPendingPrDetectionToScoreInput(base, {
+        source: "github_observed",
+        pendingMergedPrCount: 1,
+        pendingClosedPrCount: 0,
+        approvedPrCount: 0,
+        expectedOpenPrCountAfterMerge: 2,
+        scenarioNotes: ["observed"],
+        classified: [],
+      }),
+    ).toMatchObject({ pendingMergedPrCount: 1, pendingScenarioObserved: true, scenarioNotes: ["observed"] });
+  });
+
+  it("loads cached reviews and checks for contributor open PRs", async () => {
+    const env = {} as Env;
+    vi.spyOn(repositories, "listPullRequestReviews").mockResolvedValue([approvedReview(70)]);
+    vi.spyOn(repositories, "listCheckSummaries").mockResolvedValue([]);
+    const records = await loadContributorRepoOpenPrSignalRecords(env, "entrius/allways-ui", "miner-a", [
+      pr({ number: 70 }),
+      pr({ number: 71, authorLogin: "other-user" }),
+      pr({ number: 72, state: "closed" }),
+    ]);
+    expect(records.pullRequestReviews).toHaveLength(1);
+    expect(records.pullRequestChecks).toHaveLength(0);
+    vi.restoreAllMocks();
   });
 });
